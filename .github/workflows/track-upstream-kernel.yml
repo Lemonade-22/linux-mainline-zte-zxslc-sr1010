@@ -286,16 +286,27 @@ jobs:
             ].join('\n');
 
             const { owner, repo } = context.repo;
-            const open = await github.rest.issues.listForRepo({
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100,
-            });
-            const existing = open.data.find((issue) => issue.title === title);
-            if (existing) {
-              core.info('已存在同名 open issue #' + existing.number + '，不重复创建');
-              return;
+            try {
+              const open = await github.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: 'open',
+                per_page: 100,
+              });
+              const existing = open.data.find((issue) => issue.title === title);
+              if (existing) {
+                core.info('已存在同名 open issue #' + existing.number + '，不重复创建');
+                return;
+              }
+              const created = await github.rest.issues.create({ owner, repo, title, body });
+              core.info('已创建 issue #' + created.data.number);
+            } catch (error) {
+              // 仓库若关闭了 Issues（has_issues=false），这里会 410/410 报错：
+              // 明确提示到运行摘要里，并保持运行红色，避免冲突被静默吞掉。
+              core.error('创建/查询 Issue 失败：' + error.message);
+              core.error('若仓库 Issues 处于关闭状态，请在 Settings -> General -> Features 勾选 Issues 后重跑。');
+              await core.summary
+                .addRaw('### Issue 创建失败\n\n' + error.message + '\n\n请在仓库 Settings 中开启 Issues，或手动按 issue 模板跟进。\n')
+                .write();
+              throw error;
             }
-            const created = await github.rest.issues.create({ owner, repo, title, body });
-            core.info('已创建 issue #' + created.data.number);
