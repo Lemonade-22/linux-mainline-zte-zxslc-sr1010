@@ -1,0 +1,312 @@
+name: Track Upstream Kernel
+
+# 为什么用 stable delta 而不是 git merge：
+#   本仓库是 cnjn 的 ZX279133 工作树应用在 Linux 6.18.60 上的 fork，目录是从内核源码树
+#   重新初始化的，没有主线 git 历史。上游 tag 与本仓库之间不存在共同祖先，
+#   git merge 会直接报 "refusing to merge unrelated histories"；
+#   即便加 --allow-unrelated-histories，整树合并也会把上游 2000+ 个无关提交和文件结构
+#   全部搬进来，等于把内核完全覆盖掉。
+#   所以这里只取 gregkh stable 相邻两个 tag 之间的 diff（stable delta），
+#   用 git apply --3way 三方应用，并且逐个小版本步进（60 -> 61 -> 62 ...），
+#   一次只搬一个小版本的修复：冲突能精确落到某个小版本上，也便于回滚和定位。
+
+on:
+  schedule:
+    # 每 6 小时的第 23 分钟检查一次（避开整点拥堵）
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: track-upstream-kernel
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: 检测并跟进上游 stable
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_VERSION_URL: https://raw.githubusercontent.com/VIKINGYFY/immortalwrt/owrt/target/linux/generic/kernel-6.18
+      KERNEL_SERIES: "6.18"
+      TARGET_BRANCH: build-6.18.x
+    steps:
+      - name: 读取上游内核版本（VIKINGYFY/immortalwrt owrt）
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP_FILE="$(mktemp)"
+          # -fsSL：失败即报错、静默、跟随跳转；--retry 3 抗抖动
+          if ! curl -fsSL --retry 3 -o "$TMP_FILE" "$UPSTREAM_VERSION_URL"; then
+            echo "::error::无法获取上游版本文件：$UPSTREAM_VERSION_URL"
+            echo "--- 响应片段（可能为空） ---"
+            head -20 "$TMP_FILE" || true
+            exit 1
+          fi
+
+          # 目标行形如：LINUX_VERSION-6.18 = .60
+          SUBLEVEL="$(sed -n 's/^LINUX_VERSION-6\.18[[:space:]]*=[[:space:]]*\.\([0-9][0-9]*\).*/\1/p' "$TMP_FILE" | head -1)"
+          if [ -z "$SUBLEVEL" ]; then
+            echo "::error::在上游文件中找不到 LINUX_VERSION-6.18 的值"
+            echo "--- 原文片段 ---"
+            head -20 "$TMP_FILE"
+            exit 1
+          fi
+
+          UPSTREAM_VERSION="$KERNEL_SERIES.$SUBLEVEL"
+          echo "上游版本：$UPSTREAM_VERSION"
+          echo "version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 检出 ${{ env.TARGET_BRANCH }}
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: build-6.18.x
+          # 必须完整历史：git apply --3way 需要树/blobs 才能做三方合并
+          fetch-depth: 0
+
+      - name: 读取本地内核版本（Makefile）
+        id: local
+        shell: bash
+        run: |
+          set -euo pipefail
+          get_field() {
+            sed -n "s/^$1[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" Makefile | head -1
+          }
+          VERSION_MAJOR="$(get_field VERSION)"
+          PATCHLEVEL="$(get_field PATCHLEVEL)"
+          SUBLEVEL="$(get_field SUBLEVEL)"
+          if [ -z "$VERSION_MAJOR" ] || [ -z "$PATCHLEVEL" ] || [ -z "$SUBLEVEL" ]; then
+            echo "::error::无法从 Makefile 读取 VERSION/PATCHLEVEL/SUBLEVEL"
+            head -8 Makefile || true
+            exit 1
+          fi
+          LOCAL_VERSION="$VERSION_MAJOR.$PATCHLEVEL.$SUBLEVEL"
+          echo "本地版本：$LOCAL_VERSION"
+          echo "version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 比较上游与本地版本
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="${{ steps.upstream.outputs.version }}"
+          LOC="${{ steps.local.outputs.version }}"
+
+          if [ "$UP" = "$LOC" ]; then
+            echo "already up to date：上游 $UP == 本地 $LOC"
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### already up to date"
+              echo ""
+              echo "上游 \`$UP\` 与本地 \`$LOC\` 一致，无需跟进。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+
+          # 只升级不降级：要求上游主/次/小版本逐段 >= 本地
+          IFS=. read -r UP_MAJOR UP_MINOR UP_PATCH <<< "$UP"
+          IFS=. read -r LO_MAJOR LO_MINOR LO_PATCH <<< "$LOC"
+          if [ "$UP_MAJOR" -lt "$LO_MAJOR" ] ||
+             { [ "$UP_MAJOR" -eq "$LO_MAJOR" ] && [ "$UP_MINOR" -lt "$LO_MINOR" ]; } ||
+             { [ "$UP_MAJOR" -eq "$LO_MAJOR" ] && [ "$UP_MINOR" -eq "$LO_MINOR" ] && [ "$UP_PATCH" -lt "$LO_PATCH" ]; }; then
+            echo "::error::上游 $UP 低于本地 $LOC，本 workflow 只跟进不降级"
+            exit 1
+          fi
+
+          echo "需要跟进：本地 $LOC -> 上游 $UP"
+          echo "local=$LOC" >> "$GITHUB_OUTPUT"
+          echo "upstream=$UP" >> "$GITHUB_OUTPUT"
+
+      - name: 逐级应用 stable delta
+        id: apply
+        if: ${{ steps.compare.outputs.up_to_date == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOCAL="${{ steps.local.outputs.version }}"
+          TARGET="${{ steps.upstream.outputs.version }}"
+          SERIES="${TARGET%.*}"
+          LOCAL_SUB="${LOCAL##*.}"
+          TARGET_SUB="${TARGET##*.}"
+
+          # 输出初始化：conflict 决定后面是否允许 push
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "failed_step=" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<__FILES__"
+            echo "__FILES__"
+          } >> "$GITHUB_OUTPUT"
+
+          # 不能用 merge/rebase 上游 tag：无共同祖先（unrelated histories），
+          # 整树合并会把无关内容全部覆盖；这里只搬 stable 两个相邻 tag 之间的 delta。
+          if ! git remote get-url stable > /dev/null 2>&1; then
+            git remote add stable https://github.com/gregkh/linux.git
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          APPLIED=""
+          for (( sub = LOCAL_SUB + 1; sub <= TARGET_SUB; sub++ )); do
+            prev=$(( sub - 1 ))
+            prev_tag="v${SERIES}.${prev}"
+            next_tag="v${SERIES}.${sub}"
+            step_desc="${prev_tag} -> ${next_tag}"
+            echo "::group::${step_desc}"
+
+            # 注意：显式取 tag 到 refs/tags/，且不加 --depth ——
+            # 浅取会让 git diff 找不到共同祖先，三方合并也就无从谈起。
+            if ! git fetch --no-tags stable "refs/tags/${prev_tag}:refs/tags/${prev_tag}" ||
+               ! git fetch --no-tags stable "refs/tags/${next_tag}:refs/tags/${next_tag}"; then
+              echo "::endgroup::"
+              echo "::error::拉取 stable tag 失败（${step_desc}）"
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "failed_step=${step_desc}（拉取 tag 失败）" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            git diff "${prev_tag}" "${next_tag}" > /tmp/step.diff
+            if [ ! -s /tmp/step.diff ]; then
+              echo "两个 tag 内容一致，跳过 ${step_desc}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! git apply --3way --whitespace=nowarn /tmp/step.diff; then
+              echo "::error::${step_desc} 应用失败，立即停止（本次运行不会 push）"
+              files="$(git diff --name-only --diff-filter=U || true)"
+              if [ -z "$files" ]; then
+                files="$(git ls-files -u | awk '{print $4}' | sort -u || true)"
+              fi
+              echo "冲突文件："
+              printf '%s\n' "$files"
+              echo "::endgroup::"
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "failed_step=${step_desc}" >> "$GITHUB_OUTPUT"
+              {
+                echo "files<<__FILES__"
+                printf '%s\n' "$files"
+                echo "__FILES__"
+              } >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            git add -A
+            if git diff --cached --quiet; then
+              echo "${next_tag} 无实际改动，跳过提交"
+            else
+              git commit -m "chore: sync stable ${next_tag}"
+              APPLIED="${APPLIED}${next_tag} "
+              echo "已提交 ${next_tag}"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "applied=${APPLIED% }" >> "$GITHUB_OUTPUT"
+
+      - name: 推送到 ${{ env.TARGET_BRANCH }}
+        id: push
+        if: ${{ success() && steps.compare.outputs.up_to_date == 'false' && steps.apply.outputs.conflict == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${TARGET_BRANCH}"
+          echo "=================================================="
+          echo "已跟进上游内核：v${{ steps.local.outputs.version }} -> v${{ steps.upstream.outputs.version }}"
+          echo "推送目标：${TARGET_BRANCH}"
+          echo "涉及的 stable tag：${{ steps.apply.outputs.applied }}"
+          echo "=================================================="
+          {
+            echo "### 已跟进上游内核"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 本地原版本 | \`v${{ steps.local.outputs.version }}\` |"
+            echo "| 上游版本 | \`v${{ steps.upstream.outputs.version }}\` |"
+            echo "| 应用的 stable tag | \`${{ steps.apply.outputs.applied }}\` |"
+            echo "| 目标分支 | \`${TARGET_BRANCH}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 冲突时创建 Issue（绝不 push）
+        if: ${{ failure() || steps.apply.outputs.conflict == 'true' }}
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM_VERSION: ${{ steps.upstream.outputs.version }}
+          LOCAL_VERSION: ${{ steps.local.outputs.version }}
+          FAILED_STEP: ${{ steps.apply.outputs.failed_step }}
+          CONFLICT_FILES: ${{ steps.apply.outputs.files }}
+        with:
+          script: |
+            const upstream = process.env.UPSTREAM_VERSION || 'unknown';
+            const local = process.env.LOCAL_VERSION || 'unknown';
+            const failedStep = process.env.FAILED_STEP || '';
+            const branch = process.env.TARGET_BRANCH || 'build-6.18.x';
+            const files = (process.env.CONFLICT_FILES || '')
+              .split('\n')
+              .map((line) => line.trim())
+              .filter(Boolean);
+
+            const runUrl = process.env.GITHUB_SERVER_URL + '/' + process.env.GITHUB_REPOSITORY
+              + '/actions/runs/' + process.env.GITHUB_RUN_ID;
+            const title = '[kernel] 上游 v' + upstream + ' 自动跟进失败：需人工解决冲突';
+
+            const body = [
+              '## 上游内核自动跟进失败',
+              '',
+              '| 项目 | 值 |',
+              '| --- | --- |',
+              '| 上游版本（VIKINGYFY/immortalwrt \`owrt\` kernel-6.18） | \`v' + upstream + '\` |',
+              '| 本地版本（\`' + branch + '\` Makefile） | \`v' + local + '\` |',
+              '| 卡在 | ' + (failedStep ? '\`' + failedStep + '\`' : '未知步骤，请看运行日志') + ' |',
+              '',
+              '### 冲突文件',
+              files.length
+                ? files.map((f) => '- \`' + f + '\`').join('\n')
+                : '_无（失败可能发生在应用 delta 之前，例如拉取 tag 或读取版本失败）_',
+              '',
+              '### 运行链接',
+              runUrl,
+              '',
+              '### 处理建议',
+              '1. 本地准备：\`git remote add stable https://github.com/gregkh/linux.git\`（已存在则跳过）。',
+              '2. 复现卡住的那一步：\`git fetch stable refs/tags/<prev>:refs/tags/<prev>\` 与 \`git fetch stable refs/tags/<next>:refs/tags/<next>\`，注意不要用 \`--depth\`。',
+              '3. 生成并三方应用 delta：\`git diff <prev> <next> > /tmp/step.diff && git apply --3way /tmp/step.diff\`。',
+              '4. 按上面冲突文件列表手工解决，\`git add -A\` 后 \`git commit -m "chore: sync stable <next>"\`。',
+              '5. 本地至少编译一遍 ZX279133 目标验证，再手动 push 到 \`' + branch + '\`，关闭本 issue。',
+              '',
+              '_该 workflow 一旦遇到冲突就不会 push，分支保持原状。_',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            try {
+              const open = await github.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: 'open',
+                per_page: 100,
+              });
+              const existing = open.data.find((issue) => issue.title === title);
+              if (existing) {
+                core.info('已存在同名 open issue #' + existing.number + '，不重复创建');
+                return;
+              }
+              const created = await github.rest.issues.create({ owner, repo, title, body });
+              core.info('已创建 issue #' + created.data.number);
+            } catch (error) {
+              // 仓库若关闭了 Issues（has_issues=false），这里会 410/410 报错：
+              // 明确提示到运行摘要里，并保持运行红色，避免冲突被静默吞掉。
+              core.error('创建/查询 Issue 失败：' + error.message);
+              core.error('若仓库 Issues 处于关闭状态，请在 Settings -> General -> Features 勾选 Issues 后重跑。');
+              await core.summary
+                .addRaw('### Issue 创建失败\n\n' + error.message + '\n\n请在仓库 Settings 中开启 Issues，或手动按 issue 模板跟进。\n')
+                .write();
+              throw error;
+            }
